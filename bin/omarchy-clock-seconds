@@ -1,0 +1,185 @@
+#!/bin/bash
+
+# omarchy-clock-seconds: put seconds on the Omarchy bar clock.
+#
+# Editing shell.json alone cannot work: the built-in clock hardcodes minute
+# precision, so a `ss` in the format renders a field that only refreshes once a
+# minute. And its right-click format ring is built from presets that carry no
+# seconds, so one right click drops the seconds again. Both live in
+# package-owned files under /usr/share/omarchy, which every Omarchy update
+# overwrites.
+#
+# So this clones the built-in clock into ~/.config/omarchy/plugins (the
+# supported way to own a built-in) and patches the two lines that matter.
+#
+# usage: omarchy-clock-seconds [install [--no-restart] | uninstall | status]
+
+set -euo pipefail
+
+SOURCE_ID=omarchy.clock
+PLUGIN_ID="${USER:-$(id -un)}.clock"
+PLUGINS_DIR="$HOME/.config/omarchy/plugins"
+CLONE_DIR="$PLUGINS_DIR/$PLUGIN_ID"
+SHELL_CONFIG="$HOME/.config/omarchy/shell.json"
+QML_CACHE="$HOME/.cache/quickshell/qmlcache"
+PATCH_FILE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../patch/clock-seconds.patch"
+
+die() {
+  echo "omarchy-clock-seconds: $*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+patch_applied() {
+  [[ -f $CLONE_DIR/BarWidget.qml ]] &&
+    grep -q 'precision: SystemClock.Seconds' "$CLONE_DIR/BarWidget.qml"
+}
+
+# Qt compiles the plugin's QML and JS into a disk cache. A plugin edit does NOT
+# hot-reload into the running shell, so the only honest check that the shell is
+# actually running the patched code is to look for the seconds literals in the
+# compiled output. Absence is a warning, not a failure: the cache may not have
+# been rewritten yet, or the widget may not have been created.
+running_code_has_seconds() {
+  [[ -d $QML_CACHE ]] || return 1
+  # Read the whole cached dump into a variable rather than piping into
+  # `grep -q`: grep exits on the first match, and under `pipefail` the resulting
+  # SIGPIPE to strings would turn a match into a failure.
+  local dump
+  dump=$(strings -a -e l "$QML_CACHE"/*.jsc 2>/dev/null || true)
+  [[ $dump == *HH:mm:ss* ]]
+}
+
+# Restart is mandatory: this plugin ignores hot reload, so without it the shell
+# keeps running the old code and the label looks unchanged.
+restart_shell() {
+  need omarchy-restart-shell
+  omarchy-restart-shell
+}
+
+# Edit the configured format of the clock's bar entry in place, preserving every
+# other setting. The clone keeps the built-in's bar entry id, so the entry to
+# touch is the plugin id it was cloned to.
+edit_format() {
+  local mode="$1"
+  [[ -f $SHELL_CONFIG ]] || return 0
+  need jq
+
+  local tmp
+  tmp=$(mktemp)
+  jq --arg id "$PLUGIN_ID" --arg mode "$mode" '
+    # Qt minutes are `mm` (months are `MM`). Add `:ss` after the minute token,
+    # or strip the first `:ss` again. Shorter formats such as the ISO date
+    # preset have no `mm` and are left alone.
+    def addss:
+      if type == "string" and test("mm(?!:ss)") then sub("mm(?!:ss)"; "mm:ss") else . end;
+    def delss:
+      if type == "string" then sub(":ss"; "") else . end;
+    .bar.layout
+    |= with_entries(
+      .value |= (if type == "array" then map(
+        if (.id? == $id) then
+          .format = ((.format // "ddd d MMM HH:mm") | if $mode == "add" then addss else delss end)
+        else . end
+      ) else . end)
+    )
+  ' "$SHELL_CONFIG" >"$tmp"
+  mv "$tmp" "$SHELL_CONFIG"
+}
+
+install_clock_seconds() {
+  local restart=1
+  [[ ${1:-} == "--no-restart" ]] && restart=0
+
+  need omarchy-plugin-clone
+  need patch
+  [[ -f $PATCH_FILE ]] || die "patch not found: $PATCH_FILE"
+
+  if [[ -d $CLONE_DIR ]]; then
+    echo "Clone already present: $CLONE_DIR"
+  else
+    # Bails out if the bar already holds a clock under another owner's clone;
+    # that state needs a human, not a second clone.
+    omarchy-plugin-clone "$SOURCE_ID"
+  fi
+
+  if patch_applied; then
+    echo "Patch already applied to $CLONE_DIR"
+  else
+    patch -p1 -d "$CLONE_DIR" <"$PATCH_FILE"
+  fi
+
+  edit_format add
+  echo "Configured format: $(jq -r --arg id "$PLUGIN_ID" \
+    '[.bar.layout[]?[]? | select(.id? == $id) | .format] | first // "(none)"' "$SHELL_CONFIG")"
+
+  ((restart)) || {
+    echo "Skipped restart (--no-restart): the running shell still has the old code."
+    return 0
+  }
+
+  restart_shell
+
+  if running_code_has_seconds; then
+    echo "Verified: the running shell has the seconds-bearing code loaded."
+  else
+    echo "Warning: could not confirm the patched code in the QML cache." >&2
+    echo "         If the label still shows no seconds, rerun: omarchy-clock-seconds status" >&2
+  fi
+}
+
+uninstall_clock_seconds() {
+  need omarchy-plugin-remove
+
+  if [[ -d $CLONE_DIR ]]; then
+    # --yes because this may also be paging a human via gum; it restores the
+    # built-in clock (clonedFrom) and rescans on its own.
+    omarchy-plugin-remove "$PLUGIN_ID" --yes
+  else
+    echo "Clone not installed: $CLONE_DIR"
+  fi
+
+  edit_format remove
+  restart_shell
+  echo "Restored the built-in clock."
+}
+
+status_clock_seconds() {
+  if [[ -d $CLONE_DIR ]]; then
+    echo "clone:   $CLONE_DIR"
+  else
+    echo "clone:   not installed"
+  fi
+
+  if patch_applied; then
+    echo "patch:   applied"
+  elif [[ -d $CLONE_DIR ]]; then
+    echo "patch:   NOT applied"
+  else
+    echo "patch:   n/a"
+  fi
+
+  if [[ -f $SHELL_CONFIG ]]; then
+    echo "format:  $(jq -r --arg id "$PLUGIN_ID" \
+      '[.bar.layout[]?[]? | select(.id? == $id) | .format] | first // "(not in the bar)"' "$SHELL_CONFIG")"
+  fi
+
+  if running_code_has_seconds; then
+    echo "runtime: patched code compiled into the QML cache"
+  else
+    echo "runtime: no seconds-bearing code found in the QML cache"
+  fi
+}
+
+case "${1:-}" in
+install) install_clock_seconds "${2:-}" ;;
+uninstall) uninstall_clock_seconds ;;
+status | "") status_clock_seconds ;;
+-h | --help)
+  sed -n '3,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  ;;
+*) die "unknown command: $1 (try: install, uninstall, status)" ;;
+esac
